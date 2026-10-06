@@ -248,7 +248,7 @@ impl HttpFilter for AiGuardrailsFilter {
     fn request_body_access(&self) -> BodyAccess {
         if self.phase.request {
             BodyAccess::ReadWrite
-        } else if self.phase.tool_results {
+        } else if self.phase.response || self.phase.tool_results {
             BodyAccess::ReadOnly
         } else {
             BodyAccess::None
@@ -256,7 +256,7 @@ impl HttpFilter for AiGuardrailsFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
-        if self.phase.request {
+        if self.phase.request || self.phase.response {
             BodyMode::StreamBuffer {
                 max_bytes: Some(DEFAULT_MAX_BODY_BYTES),
             }
@@ -290,16 +290,25 @@ impl HttpFilter for AiGuardrailsFilter {
                 Ok(_) => {},
             }
         }
-
-        if !self.phase.request {
-            return Ok(FilterAction::Continue);
-        }
-
         let Some(bytes) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
 
         if bytes.is_empty() {
+            return Ok(FilterAction::Continue);
+        }
+
+        // The current response-phase guardrail implementation cannot inspect a
+        // streamed response because SSE responses remain in streaming mode.
+        // Rather than let it stream through unevaluated, reject the request
+        // before the model is invoked.
+        if self.phase.response && requests_streaming(bytes)? {
+            return Ok(FilterAction::Reject(Rejection::status(422).with_body(
+                "ai_guardrails: streaming responses are not supported while a response guardrail is active",
+            )));
+        }
+
+        if !self.phase.request {
             return Ok(FilterAction::Continue);
         }
 
@@ -559,6 +568,18 @@ pub(super) fn fit_to_committed_length(replacement: String, original_body: &Optio
     }
 }
 
+/// Whether the request asks the upstream for a streamed response via
+/// `"stream": true`.
+///
+/// A malformed body returns an error, allowing the pipeline's failure mode
+/// to handle it consistently with [`extract_messages`].
+fn requests_streaming(body: &Bytes) -> Result<bool, FilterError> {
+    let json: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| -> FilterError { format!("ai_guardrails: request body is not valid JSON: {e}").into() })?;
+
+    Ok(json.get("stream").and_then(serde_json::Value::as_bool).unwrap_or(false))
+}
+
 /// Extract messages from an OpenAI Chat Completion request body.
 fn extract_messages(body: &Bytes) -> Result<Vec<serde_json::Value>, FilterError> {
     let mut json: serde_json::Value = serde_json::from_slice(body)
@@ -611,6 +632,51 @@ fn is_event_stream(ctx: &HttpFilterContext<'_>) -> bool {
                 .next()
                 .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
         })
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, reason = "tests")]
+mod streaming_tests {
+    use bytes::Bytes;
+
+    use super::requests_streaming;
+
+    #[test]
+    fn stream_true_is_detected() {
+        let body = Bytes::from_static(br#"{"model":"m","messages":[],"stream":true}"#);
+        assert!(
+            requests_streaming(&body).unwrap(),
+            "stream=true should request streaming"
+        );
+    }
+
+    #[test]
+    fn stream_false_is_not_streaming() {
+        let body = Bytes::from_static(br#"{"model":"m","messages":[],"stream":false}"#);
+        assert!(
+            !requests_streaming(&body).unwrap(),
+            "stream=false should not request streaming"
+        );
+    }
+
+    #[test]
+    fn absent_stream_is_not_streaming() {
+        let body = Bytes::from_static(br#"{"model":"m","messages":[]}"#);
+        assert!(
+            !requests_streaming(&body).unwrap(),
+            "an absent stream field should not request streaming"
+        );
+    }
+
+    #[test]
+    fn malformed_body_fails_closed() {
+        let body = Bytes::from_static(b"not json");
+        assert!(
+            requests_streaming(&body).is_err(),
+            "malformed JSON should return an error"
+        );
+    }
 }
 
 #[cfg(test)]
